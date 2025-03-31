@@ -7,8 +7,6 @@ An AI-powered application that analyzes daily news, generates images based on th
 - Daily news analysis using AI
 - AI-powered image generation based on news analysis
 - Telegram bot for easy access to daily images
-- Admin API for managing image generation and vector database
-- Vector database for storing and retrieving news analysis
 - Scheduled daily updates at 13:00
 - Redis caching for improved performance
 - Docker support for easy deployment
@@ -99,17 +97,6 @@ x-api-key: your_admin_api_key
 }
 ```
 
-### Fill Vector DB for Specific Date
-```
-POST /admin/fill-vector-db
-Content-Type: application/json
-x-api-key: your_admin_api_key
-
-{
-    "date": "2024-03-30"
-}
-```
-
 ## Health Check
 
 The application includes a health check endpoint that monitors the Redis connection:
@@ -126,7 +113,6 @@ news-maker/
 │   ├── services/
 │   │   ├── imageGeneration.js
 │   │   ├── telegramBot.js
-│   │   ├── vectorDB.js
 │   │   └── redis.js
 │   ├── routes/
 │   │   └── adminRoutes.js

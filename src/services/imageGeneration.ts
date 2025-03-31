@@ -1,151 +1,302 @@
-import axios from 'axios';
-import { OpenAI } from '@langchain/openai';
-import { ChatOpenAI } from '@langchain/openai';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
-import { Pinecone } from "@pinecone-database/pinecone";
-import { promises as fs } from 'fs';
-import path from 'path';
-import { getCachedData, setCachedData } from './redis.js';
+import { ChatAnthropic } from "@langchain/anthropic";
+import {
+  StateGraph,
+  MessagesAnnotation,
+  END,
+  START,
+} from "@langchain/langgraph";
+import { HumanMessage, SystemMessage } from "@langchain/core/messages";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import dotenv from "dotenv";
+import { Article } from '../types/news';
 
-const openai = new OpenAI({
-  openAIApiKey: process.env.OPENAI_API_KEY,
+dotenv.config();
+
+interface AgentState {
+  newsArticles: Array<{
+    title: string;
+    description: string;
+    url: string;
+    source: string;
+    publishedAt: string;
+  }>;
+  newsSummary: string | null;
+  keyThemes: string[];
+  imagePrompt: string | null;
+  imageUrl: string | null;
+  error: string | null;
+}
+
+const initialState: AgentState = {
+  newsArticles: [],
+  newsSummary: null,
+  keyThemes: [],
+  imagePrompt: null,
+  imageUrl: null,
+  error: null,
+};
+
+const llm = new ChatAnthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  model: "claude-3-haiku-20240307",
 });
 
-const chatModel = new ChatOpenAI({
-  openAIApiKey: process.env.OPENAI_API_KEY,
-  modelName: "gpt-4-turbo-preview",
-});
-
-const pinecone = new Pinecone({
-    apiKey: process.env.PINECONE_API_KEY as string,
-    environment: process.env.PINECONE_ENVIRONMENT as string,
-});
-
-export const getNews = async (fromDate: string, toDate: string) => {
-    const cacheKey = `news_${fromDate}_${toDate}`;
-    const cachedNews = await getCachedData(cacheKey);
-    
-    if (cachedNews) {
-        return cachedNews;
+// Node 1: Fetch News Articles
+export const fetchNews = async (state: AgentState): Promise<AgentState> => {
+  try {
+    const newsApiKey = process.env.NEWS_API_KEY;
+    if (!newsApiKey) {
+        throw new Error("ERROR: API key for NEWS_API_KEY is missing");
     }
 
-    const response = await axios.get('https://newsapi.org/v2/everything', {
-        params: {
-            apiKey: process.env.NEWS_API_KEY,
-            from: fromDate,
-            to: toDate,
-            language: 'en',
-            sortBy: 'publishedAt',
-        },
-    });
-
-    const articles = response.data.articles;
-    await setCachedData(cacheKey, articles);
-    return articles;
-}
-
-export const analyzeNews = async (articles: { title: string, description: string }[]) => {
-    const newsSummary = articles.map(article => 
-        `Title: ${article.title}\nDescription: ${article.description}\n`
-    ).join('\n');
-
-    const analysisPrompt = new SystemMessage(
-        'You are a news analyst. Analyze the following news articles and provide a comprehensive summary of the main themes and significant events.'
+    const response = await fetch(
+      `https://newsapi.org/v2/top-headlines?country=uspageSize=10page=1&apiKey=${newsApiKey}`
     );
 
-    const analysis = await chatModel.invoke([
-        analysisPrompt,
-        new HumanMessage(newsSummary),
-    ]);
-
-    return analysis.content;
-}
-
-async function generateImagePrompt(analysis) {
-    const promptSystem = new SystemMessage(
-        'You are an expert at creating detailed image generation prompts. Create a vivid, detailed prompt for an image that represents the main themes of the news analysis.'
-    );
-
-    const prompt = await chatModel.invoke([
-        promptSystem,
-        new HumanMessage(`Based on this news analysis, create a detailed image generation prompt:\n${analysis}`),
-    ]);
-
-    return prompt.content;
-}
-
-async function generateImage(prompt) {
-    const response = await openai.images.generate({
-        model: "dall-e-3",
-        prompt: prompt,
-        n: 1,
-        size: "1024x1024",
-        quality: "standard",
-    });
-
-    return response.data[0].url;
-}
-
-async function downloadAndSaveImage(imageUrl, date) {
-    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-    const fileName = `image_${date}.png`;
-    const filePath = path.join(process.env.IMAGE_STORAGE_PATH, fileName);
-    
-    await fs.writeFile(filePath, response.data);
-    return filePath;
-}
-
-async function saveToVectorDB(analysis, date) {
-    const index = pinecone.Index(process.env.PINECONE_INDEX_NAME);
-    
-    await index.upsert({
-        vectors: [{
-            id: `news_${date}`,
-            values: await getEmbedding(analysis),
-            metadata: {
-                date,
-                analysis,
-            }
-        }]
-    });
-}
-
-async function getEmbedding(text) {
-    const response = await openai.embeddings.create({
-        model: "text-embedding-3-small",
-        input: text,
-    });
-    return response.data[0].embedding;
-}
-
-export async function generateDailyImage(date = new Date().toISOString().split('T')[0]) {
-    const cacheKey = `daily_image_${date}`;
-    const cachedResult = await getCachedData(cacheKey);
-    
-    if (cachedResult) {
-        return cachedResult;
+    if (!response.ok) {
+      const errorData = await response.json();
+      return {
+        ...state,
+        error: `Failed to fetch news: ${
+          errorData.message || response.statusText
+        }`,
+      };
     }
 
-    const fromDate = new Date();
-    fromDate.setDate(fromDate.getDate() - 1);
-    fromDate.setHours(13, 0, 0, 0);
-    
-    const toDate = new Date();
-    toDate.setHours(13, 0, 0, 0);
+    const data = await response.json();
+    const articles = data.articles as Article[];
 
-    const articles = await getNews(fromDate.toISOString(), toDate.toISOString());
-    const analysis = await analyzeNews(articles);
-    const imagePrompt = await generateImagePrompt(analysis);
-    const imageUrl = await generateImage(imagePrompt);
-    const savedPath = await downloadAndSaveImage(imageUrl, date);
-    await saveToVectorDB(analysis, date);
+    const processedArticles = articles.map((article) => ({
+      title: article.title || "",
+      description: article.description || "",
+      url: article.url || "",
+      source: article.source?.name || "",
+      publishedAt: article.publishedAt || "",
+    }));
 
-    const result = {
-        date,
-        analysis,
-        imagePath: savedPath,
+    return {
+      ...state,
+      newsArticles: processedArticles,
     };
+  } catch (error) {
+    return {
+      ...state,
+      error: `Error fetching news: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+}
 
-    await setCachedData(cacheKey, result);
-    return result;
-} 
+// Node 2: Analyze News with RAG
+export const analyzeNews = async (state: AgentState): Promise<AgentState> => {
+  if (state.error) return state;
+
+  try {
+    // Create context from news articles
+    const context = state.newsArticles
+      .map(
+        (article) =>
+          `Title: ${article.title}\nDescription: ${article.description}\nSource: ${article.source}`
+      )
+      .join("\n\n");
+
+    // Create prompt for analysis
+    const prompt = ChatPromptTemplate.fromMessages([
+      new SystemMessage(
+        "You are a news analyst specialized in identifying important trends and themes."
+      ),
+      new HumanMessage(`
+        Analyze these recent news articles and provide:
+        
+        1. A concise summary (2-3 sentences) of the most significant current news trend
+        2. A list of exactly 5 key themes or topics from these articles
+        
+        Format your response as follows:
+        SUMMARY: [your summary here]
+        THEMES: [theme1], [theme2], [theme3], [theme4], [theme5]
+        
+        Here are the articles:
+        
+        ${context}
+      `),
+    ]);
+
+    // Get response from LLM
+    const response = await llm.invoke([
+      await prompt.formatMessages({ context }),
+    ]);
+
+    const responseText = response.content;
+
+    // Parse the response
+    const summaryMatch = /SUMMARY:(.+?)(?=\n|$)/s.exec(responseText as string);
+    const themesMatch = /THEMES:(.+?)(?=\n|$)/s.exec(responseText as string);
+
+    if (!summaryMatch || !themesMatch) {
+      throw new Error("Could not parse LLM output correctly");
+    }
+
+    const summary = summaryMatch[1].trim();
+    const themes = themesMatch[1].split(",").map((theme) => theme.trim());
+
+    return {
+      ...state,
+      newsSummary: summary,
+      keyThemes: themes,
+    };
+  } catch (error) {
+    return {
+      ...state,
+      error: `Error analyzing news: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+}
+
+// Node 3: Create Image Generation Prompt
+export const createImagePrompt = async (state: AgentState): Promise<AgentState> => {
+  if (state.error) return state;
+
+  try {
+    const prompt = ChatPromptTemplate.fromMessages([
+      new SystemMessage(`
+        You are a specialist in creating effective prompts for AI image generation.
+        Your task is to craft a detailed, visually descriptive prompt based on news content.
+      `),
+      new HumanMessage(`
+        Create a detailed prompt for an AI image generator based on this news summary and themes.
+        Focus on visual elements, style, composition, and mood.
+        The prompt should be under 100 words and highly descriptive.
+        
+        News Summary: ${state.newsSummary}
+        Key Themes: ${state.keyThemes.join(", ")}
+        
+        Format your response as a single paragraph without any prefixes or explanations.
+      `),
+    ]);
+
+    const response = await llm.invoke([
+      await prompt.formatMessages({
+        summary: state.newsSummary,
+        themes: state.keyThemes.join(", "),
+      }),
+    ]);
+
+    return {
+      ...state,
+      imagePrompt: response.content as string,
+    };
+  } catch (error) {
+    return {
+      ...state,
+      error: `Error creating image prompt: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+}
+
+// Node 4: Generate Image
+export const generateImage =  async (state: AgentState): Promise<AgentState> => {
+  if (state.error || !state.imagePrompt) return state;
+
+  try {
+    const stabilityApiKey = process.env.STABILITY_API_KEY;
+
+    const response = await fetch(
+      "https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Authorization: `Bearer ${stabilityApiKey}`,
+        },
+        body: JSON.stringify({
+          text_prompts: [{ text: state.imagePrompt }],
+          cfg_scale: 7,
+          height: 1024,
+          width: 1024,
+          samples: 1,
+          steps: 30,
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      return {
+        ...state,
+        error: `Failed to generate image: ${
+          errorData.message || response.statusText
+        }`,
+      };
+    }
+
+    const data = await response.json();
+    const imageBase64 = data.artifacts[0].base64;
+
+    // In a real app, you might save this to a file or database
+    // For this example, we'll just imagine we have a URL
+    const mockImageUrl = `https://example.com/generated-image-${Date.now()}.png`;
+
+    return {
+      ...state,
+      imageUrl: mockImageUrl,
+    };
+  } catch (error) {
+    return {
+      ...state,
+      error: `Error generating image: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+}
+
+export const createNewsImageGraph = async () => {
+  const builder = new StateGraph(MessagesAnnotation)
+    .addNode("fetchNews", fetchNews)
+    .addEdge(START, "fetchNews")
+    .addNode("analyzeNews", analyzeNews)
+    .addEdge("analyzeNews", "fetchNews")
+    .addNode("createImagePrompt", createImagePrompt)
+    .addEdge("createImagePrompt", "analyzeNews")
+    .addNode("generateImage", generateImage)
+    .addEdge("generateImage", END);
+
+  // Handle error conditions
+  builder.addConditionalEdges("fetchNews", (state: AgentState) =>
+    state.error ? "end" : "analyzeNews"
+  );
+
+  builder.addConditionalEdges("analyzeNews", (state: AgentState) =>
+    state.error ? "end" : "createImagePrompt"
+  );
+
+  builder.addConditionalEdges("createImagePrompt", (state: AgentState) =>
+    state.error ? "end" : "generateImage"
+  );
+
+  return builder.compile();
+}
+
+// Main function to run the agent
+export const runNewsImageAgent = async () => {
+  try {
+    const graph = await createNewsImageGraph();
+    const result = await graph.invoke(initialState);
+
+    return {
+      summary: result.newsSummary,
+      themes: result.keyThemes,
+      imagePrompt: result.imagePrompt,
+      imageUrl: result.imageUrl,
+    };
+  } catch (error) {
+    console.error("Failed to run agent:", error);
+    return null;
+  }
+}
